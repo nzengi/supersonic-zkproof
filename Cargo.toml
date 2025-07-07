@@ -1,0 +1,11 @@
+[package]
+name = "super_sonic_rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+num-bigint = { version = "0.4", features = ["rand"] }
+num-traits = "0.2"
+rand = { version = "0.8", features = ["std"] }
+sha2 = "0.10"
+curve25519-dalek = "4"

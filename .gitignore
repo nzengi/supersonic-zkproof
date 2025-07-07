@@ -1,0 +1,11 @@
+/target/
+**/*.rs.bk
+Cargo.lock
+# IDE ve sistem dosyaları
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+# Test çıktıları
+*.log 
