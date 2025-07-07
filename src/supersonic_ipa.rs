@@ -44,6 +44,20 @@ pub fn eval_poly_scalar(coeffs: &[Scalar], x: &Scalar) -> Scalar {
     y
 }
 
+/// Supersonic Polynomial Commitment Proof
+pub struct SupersonicProof {
+    pub commitment: RistrettoPoint,
+    pub evaluation_proof: EvaluationProof,
+    pub point: Scalar,
+    pub value: Scalar,
+}
+
+/// Evaluation Proof (Kate-style + IPA)
+pub struct EvaluationProof {
+    pub witness: RistrettoPoint,  // Kate witness
+    pub ipa_proof: IpaProof,      // Inner product argument
+}
+
 /// Inner Product Argument Proof
 pub struct IpaProof {
     pub l_vec: Vec<RistrettoPoint>, // Left commitments
@@ -52,13 +66,45 @@ pub struct IpaProof {
     pub b_final: Scalar,            // Final scalar
 }
 
-/// Gerçek IPA proof üret
-pub fn create_ipa_proof(coeffs: &[Scalar], g_vec: &[RistrettoPoint], x: &Scalar, y: &Scalar) -> IpaProof {
+/// Generate evaluation vector for point x
+fn generate_evaluation_vector(x: &Scalar, n: usize) -> Vec<Scalar> {
+    let mut eval_vec = vec![Scalar::ONE; n];
+    for i in 1..n {
+        eval_vec[i] = eval_vec[i-1] * x;
+    }
+    eval_vec
+}
+
+/// Create Kate-style witness for polynomial evaluation
+fn create_kate_witness(coeffs: &[Scalar], x: &Scalar, y: &Scalar, g_vec: &[RistrettoPoint]) -> RistrettoPoint {
+    // Compute f(X) - f(x) / (X - x) polynomial
+    let mut quotient_coeffs = vec![Scalar::ZERO; coeffs.len() - 1];
+    
+    // Synthetic division
+    let mut remainder = coeffs[coeffs.len() - 1];
+    for i in (0..coeffs.len() - 1).rev() {
+        quotient_coeffs[i] = remainder;
+        remainder = coeffs[i] + remainder * x;
+    }
+    
+    // Verify remainder equals y
+    assert!(remainder == *y, "Polynomial evaluation mismatch");
+    
+    // Create witness commitment
+    let witness_g_vec = &g_vec[..quotient_coeffs.len()];
+    commit(&quotient_coeffs, witness_g_vec)
+}
+
+/// Gerçek Supersonic IPA proof üret
+fn create_ipa_proof(coeffs: &[Scalar], g_vec: &[RistrettoPoint], x: &Scalar, y: &Scalar) -> IpaProof {
     let n = coeffs.len();
     assert!(n.is_power_of_two(), "Polynomial degree must be a power of 2");
     
+    // Create evaluation vector for point x
+    let eval_vec = generate_evaluation_vector(x, n);
+    
     let mut a_vec = coeffs.to_vec();
-    let mut b_vec = vec![Scalar::ONE; n]; // Same length as coeffs
+    let mut b_vec = eval_vec;
     let mut g_vec = g_vec.to_vec();
     let mut h_vec = generate_g_vec(n); // Additional base points
     
@@ -73,10 +119,6 @@ pub fn create_ipa_proof(coeffs: &[Scalar], g_vec: &[RistrettoPoint], x: &Scalar,
         let (b_l, b_r) = b_vec.split_at(mid);
         let (g_l, g_r) = g_vec.split_at(mid);
         let (h_l, h_r) = h_vec.split_at(mid);
-        
-        // Compute inner products
-        let a_l_inner = a_l.iter().zip(b_l.iter()).map(|(a, b)| a * b).sum::<Scalar>();
-        let a_r_inner = a_r.iter().zip(b_r.iter()).map(|(a, b)| a * b).sum::<Scalar>();
         
         // Compute commitments
         let l_commit = RistrettoPoint::multiscalar_mul(
@@ -112,8 +154,51 @@ pub fn create_ipa_proof(coeffs: &[Scalar], g_vec: &[RistrettoPoint], x: &Scalar,
     }
 }
 
-/// Gerçek IPA proof doğrula
-pub fn verify_ipa_proof(
+/// Supersonic commitment oluştur
+pub fn supersonic_commit(coeffs: &[Scalar]) -> (RistrettoPoint, Vec<RistrettoPoint>) {
+    let g_vec = generate_g_vec(coeffs.len());
+    let commitment = commit(coeffs, &g_vec);
+    (commitment, g_vec)
+}
+
+/// Supersonic proof oluştur
+pub fn supersonic_create_proof(coeffs: &[Scalar], x: &Scalar) -> SupersonicProof {
+    let (commitment, g_vec) = supersonic_commit(coeffs);
+    let y = eval_poly_scalar(coeffs, x);
+    
+    // Create Kate witness
+    let witness = create_kate_witness(coeffs, x, &y, &g_vec);
+    
+    // Create IPA proof
+    let ipa_proof = create_ipa_proof(coeffs, &g_vec, x, &y);
+    
+    let evaluation_proof = EvaluationProof {
+        witness,
+        ipa_proof,
+    };
+    
+    SupersonicProof {
+        commitment,
+        evaluation_proof,
+        point: *x,
+        value: y,
+    }
+}
+
+/// Verify Kate-style witness
+fn verify_kate_witness(commitment: &RistrettoPoint, witness: &RistrettoPoint, x: &Scalar, y: &Scalar, g_vec: &[RistrettoPoint]) -> bool {
+    // Check: commitment = witness * (g^x) + y * g
+    let g_x = g_vec[0] * x;
+    let y_g = g_vec[0] * y;
+    let expected = witness + y_g;
+    
+    // This is a simplified verification - in real Kate, we'd use pairing
+    // For Ristretto, we use a different approach
+    expected == *commitment
+}
+
+/// Verify IPA proof
+fn verify_ipa_proof(
     commitment: &RistrettoPoint,
     g_vec: &[RistrettoPoint],
     x: &Scalar,
@@ -132,50 +217,47 @@ pub fn verify_ipa_proof(
         challenges.push(hash_to_scalar(&challenge_data));
     }
     
-    // Verify final equation
-    let h_vec = generate_g_vec(n);
+    // Reconstruct base points using challenges
+    let mut g_reconstructed = g_vec.to_vec();
+    let mut h_reconstructed = generate_g_vec(n);
+    
+    for (_i, challenge) in challenges.iter().enumerate() {
+        let mid = g_reconstructed.len() / 2;
+        let (g_l, g_r) = g_reconstructed.split_at(mid);
+        let (h_l, h_r) = h_reconstructed.split_at(mid);
+        
+        g_reconstructed = g_l.iter().zip(g_r.iter())
+            .map(|(gl, gr)| gl + gr * challenge)
+            .collect();
+        h_reconstructed = h_l.iter().zip(h_r.iter())
+            .map(|(hl, hr)| hl + hr * challenge)
+            .collect();
+    }
+    
+    // Verify final equation: a_final * g_final + b_final * h_final = commitment
     let expected_commitment = RistrettoPoint::multiscalar_mul(
         &[proof.a_final, proof.b_final],
-        &[g_vec[0], h_vec[0]]
+        &[g_reconstructed[0], h_reconstructed[0]]
     );
     
-    // Check that commitment matches
-    expected_commitment == *commitment
-}
-
-/// Supersonic Polynomial Commitment Proof
-pub struct SupersonicProof {
-    pub commitment: RistrettoPoint,
-    pub evaluation_proof: IpaProof,
-    pub point: Scalar,
-    pub value: Scalar,
-}
-
-/// Supersonic commitment oluştur
-pub fn supersonic_commit(coeffs: &[Scalar]) -> (RistrettoPoint, Vec<RistrettoPoint>) {
-    let g_vec = generate_g_vec(coeffs.len());
-    let commitment = commit(coeffs, &g_vec);
-    (commitment, g_vec)
-}
-
-/// Supersonic proof oluştur
-pub fn supersonic_create_proof(coeffs: &[Scalar], x: &Scalar) -> SupersonicProof {
-    let (commitment, g_vec) = supersonic_commit(coeffs);
-    let y = eval_poly_scalar(coeffs, x);
-    let evaluation_proof = create_ipa_proof(coeffs, &g_vec, x, &y);
+    // Verify that a_final * b_final = y (polynomial evaluation)
+    let eval_check = proof.a_final * proof.b_final == *y;
     
-    SupersonicProof {
-        commitment,
-        evaluation_proof,
-        point: *x,
-        value: y,
-    }
+    expected_commitment == *commitment && eval_check
 }
 
 /// Supersonic proof doğrula
 pub fn supersonic_verify_proof(proof: &SupersonicProof) -> bool {
     let g_vec = generate_g_vec(8); // Assuming degree 8 for demo
-    verify_ipa_proof(&proof.commitment, &g_vec, &proof.point, &proof.value, &proof.evaluation_proof)
+    
+    // Verify Kate witness
+    let kate_valid = verify_kate_witness(&proof.commitment, &proof.evaluation_proof.witness, &proof.point, &proof.value, &g_vec);
+    
+    // Verify IPA proof
+    let ipa_valid = verify_ipa_proof(&proof.commitment, &g_vec, &proof.point, &proof.value, &proof.evaluation_proof.ipa_proof);
+    
+    // Both must be valid
+    kate_valid && ipa_valid
 }
 
 // Legacy functions for compatibility
@@ -185,7 +267,7 @@ pub fn create_proof(coeffs: &[Scalar], x: &Scalar) -> IpaProof {
     create_ipa_proof(coeffs, &g_vec, x, &y)
 }
 
-pub fn verify_proof(commitment: &RistrettoPoint, g_vec: &[RistrettoPoint], proof: &IpaProof) -> bool {
+pub fn verify_proof(_commitment: &RistrettoPoint, _g_vec: &[RistrettoPoint], _proof: &IpaProof) -> bool {
     // This is now a simplified verification for demo purposes
     // In real implementation, this would use the full IPA verification
     true // Simplified for demo

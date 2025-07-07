@@ -9,3 +9,8 @@ num-traits = "0.2"
 rand = { version = "0.8", features = ["std"] }
 sha2 = "0.10"
 curve25519-dalek = "4"
+ark-ff = "0.4"
+ark-ec = "0.4"
+ark-poly = "0.4"
+ark-bls12-381 = "0.4"
+ark-std = "0.4"
